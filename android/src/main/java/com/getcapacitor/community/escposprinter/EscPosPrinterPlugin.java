@@ -3,12 +3,22 @@ package com.getcapacitor.community.escposprinter;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothManager;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
+import android.hardware.usb.UsbManager;
 import android.os.Build;
+import android.util.Log;
 
 import androidx.activity.result.ActivityResult;
 
@@ -24,25 +34,20 @@ import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
 import com.getcapacitor.community.escposprinter.printers.BasePrinter;
 import com.getcapacitor.community.escposprinter.printers.BluetoothPrinter;
+import com.getcapacitor.community.escposprinter.printers.UsbPrinter;
 import com.getcapacitor.community.escposprinter.printers.exceptions.PrinterException;
 
 import org.json.JSONException;
 
 import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 @SuppressWarnings("unused")
 @CapacitorPlugin(
         name = "EscPosPrinter",
         permissions = {
-                /*@Permission(
-                        alias = "bluetooth-legacy",
-                        strings = {
-                                Manifest.permission.BLUETOOTH,
-                                Manifest.permission.BLUETOOTH_ADMIN
-                        }
-                ),*/
                 @Permission(
                         alias = "bluetooth",
                         strings = {
@@ -53,8 +58,125 @@ import java.util.UUID;
         }
 )
 public class EscPosPrinterPlugin extends Plugin {
+    private static final String TAG = "EscPosPrinterPlugin";
+    private static final String ACTION_USB_PERMISSION = "com.getcapacitor.community.escposprinter.USB_PERMISSION";
+
     private BluetoothAdapter bluetoothAdapter;
     private HashMap<String, BasePrinter> printersMap = new HashMap<>();
+    
+    // USB permission request tracking
+    private final Map<String, PluginCall> pendingUsbPermissionCalls = new HashMap<>();
+    private BroadcastReceiver usbPermissionReceiver;
+    private boolean receiverRegistered = false;
+
+    // ==========================================================================
+    // Plugin Lifecycle
+    // ==========================================================================
+
+    @Override
+    public void load() {
+        super.load();
+        registerUsbPermissionReceiver();
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        super.handleOnDestroy();
+        unregisterUsbPermissionReceiver();
+        
+        // Clear any pending permission calls
+        for (PluginCall call : pendingUsbPermissionCalls.values()) {
+            call.reject("Plugin destroyed before USB permission response");
+        }
+        pendingUsbPermissionCalls.clear();
+    }
+
+    // ==========================================================================
+    // USB Permission Receiver
+    // ==========================================================================
+
+    private void registerUsbPermissionReceiver() {
+        if (receiverRegistered) {
+            return;
+        }
+
+        usbPermissionReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+                if (ACTION_USB_PERMISSION.equals(action)) {
+                    handleUsbPermissionResult(intent);
+                }
+            }
+        };
+
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getContext().registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            getContext().registerReceiver(usbPermissionReceiver, filter);
+        }
+        
+        receiverRegistered = true;
+        Log.d(TAG, "USB permission receiver registered");
+    }
+
+    private void unregisterUsbPermissionReceiver() {
+        if (receiverRegistered && usbPermissionReceiver != null) {
+            try {
+                getContext().unregisterReceiver(usbPermissionReceiver);
+                Log.d(TAG, "USB permission receiver unregistered");
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "Receiver already unregistered: " + e.getMessage());
+            }
+            receiverRegistered = false;
+        }
+    }
+
+    private void handleUsbPermissionResult(Intent intent) {
+        UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+        boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
+
+        if (device == null) {
+            Log.w(TAG, "USB permission result received but device is null");
+            return;
+        }
+
+        // Build the device key to find the pending call
+        String deviceKey = buildDeviceKey(device);
+        PluginCall pendingCall = pendingUsbPermissionCalls.remove(deviceKey);
+
+        if (pendingCall == null) {
+            // Try alternate key formats (in case of matching variations)
+            String altKey1 = device.getVendorId() + ":" + device.getProductId();
+            pendingCall = pendingUsbPermissionCalls.remove(altKey1);
+        }
+
+        if (pendingCall != null) {
+            JSObject data = new JSObject();
+            data.put("value", granted);
+            pendingCall.resolve(data);
+            
+            Log.d(TAG, "USB permission " + (granted ? "granted" : "denied") + 
+                " for device: " + device.getDeviceName());
+        } else {
+            Log.w(TAG, "No pending call found for USB permission result: " + device.getDeviceName());
+        }
+    }
+
+    private String buildDeviceKey(UsbDevice device) {
+        String deviceNamePart = device.getDeviceName();
+        if (deviceNamePart.contains("/")) {
+            String[] parts = deviceNamePart.split("/");
+            deviceNamePart = parts[parts.length - 1];
+        }
+        return device.getVendorId() + ":" + device.getProductId() + ":" + deviceNamePart;
+    }
+
+    // ==========================================================================
+    // Bluetooth Methods
+    // ==========================================================================
 
     @SuppressWarnings("unused")
     @PluginMethod
@@ -104,7 +226,8 @@ public class EscPosPrinterPlugin extends Plugin {
 
                 // From https://inthehand.github.io/html/T_InTheHand_Net_Bluetooth_DeviceClass.htm
                 // 1664 - Imaging printer
-                var isPrinterDevice = majorClassType == BluetoothClass.Device.Major.IMAGING && (deviceType == 1664 || deviceType == BluetoothClass.Device.Major.IMAGING);
+                var isPrinterDevice = majorClassType == BluetoothClass.Device.Major.IMAGING && 
+                    (deviceType == 1664 || deviceType == BluetoothClass.Device.Major.IMAGING);
                 if (!isPrinterDevice) {
                     continue;
                 }
@@ -136,6 +259,225 @@ public class EscPosPrinterPlugin extends Plugin {
         call.resolve(data);
     }
 
+    // ==========================================================================
+    // USB Methods
+    // ==========================================================================
+
+    @SuppressWarnings("unused")
+    @PluginMethod
+    public void getUsbPrinterDevices(PluginCall call) {
+        var usbManager = (UsbManager) getContext().getSystemService(Context.USB_SERVICE);
+        if (usbManager == null) {
+            call.reject("USB service not available");
+            return;
+        }
+
+        var devicesArray = new JSArray();
+        var deviceList = usbManager.getDeviceList();
+
+        for (var device : deviceList.values()) {
+            // Check if device could be a printer
+            if (!isPotentialPrinter(device)) {
+                continue;
+            }
+
+            var deviceObject = new JSObject();
+
+            // Create stable identifier: vendorId:productId:deviceNamePart
+            String deviceKey = buildDeviceKey(device);
+            deviceObject.put("id", deviceKey);
+
+            // Name: use product name if available, otherwise device name
+            var name = device.getProductName();
+            if (name == null || name.isEmpty()) {
+                name = "USB Device " + device.getVendorId() + ":" + device.getProductId();
+            }
+            deviceObject.put("name", name);
+
+            deviceObject.put("vendorId", device.getVendorId());
+            deviceObject.put("productId", device.getProductId());
+            deviceObject.put("deviceClass", device.getDeviceClass());
+            deviceObject.put("deviceSubclass", device.getDeviceSubclass());
+            deviceObject.put("deviceName", device.getDeviceName());
+
+            // Optional manufacturer name
+            var manufacturerName = device.getManufacturerName();
+            if (manufacturerName != null && !manufacturerName.isEmpty()) {
+                deviceObject.put("manufacturerName", manufacturerName);
+            }
+
+            // Check if we have permission
+            deviceObject.put("hasPermission", usbManager.hasPermission(device));
+
+            devicesArray.put(deviceObject);
+
+            Log.d(TAG, "Found USB device: " + name + 
+                " (VID:" + device.getVendorId() + " PID:" + device.getProductId() + 
+                " Class:" + device.getDeviceClass() + " Permission:" + usbManager.hasPermission(device) + ")");
+        }
+
+        var data = new JSObject();
+        data.put("devices", devicesArray);
+        call.resolve(data);
+    }
+
+    /**
+     * Checks if a USB device could potentially be a printer.
+     * Returns true for:
+     * - Devices with USB_CLASS_PRINTER
+     * - Devices with interfaces that have bulk OUT endpoints (common for ESC/POS printers)
+     */
+    private boolean isPotentialPrinter(UsbDevice device) {
+        // Check device class
+        if (device.getDeviceClass() == UsbConstants.USB_CLASS_PRINTER) {
+            return true;
+        }
+
+        // Check each interface
+        for (int i = 0; i < device.getInterfaceCount(); i++) {
+            var iface = device.getInterface(i);
+            
+            // Check interface class
+            if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_PRINTER) {
+                return true;
+            }
+
+            // Check for bulk OUT endpoint (many ESC/POS printers use this)
+            for (int j = 0; j < iface.getEndpointCount(); j++) {
+                var endpoint = iface.getEndpoint(j);
+                if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK &&
+                    endpoint.getDirection() == UsbConstants.USB_DIR_OUT) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Request USB permission for a specific device.
+     * 
+     * Behavior:
+     * - If permission already granted: resolves immediately with { value: true }
+     * - If not granted: triggers OS permission dialog, then resolves with { value: true/false }
+     * - If device not found: rejects with error
+     * 
+     * This method is idempotent - safe to call multiple times.
+     */
+    @SuppressWarnings("unused")
+    @PluginMethod
+    public void requestUsbPermission(PluginCall call) {
+        var address = call.getString("address");
+        if (address == null || address.isEmpty()) {
+            call.reject("Address is required");
+            return;
+        }
+
+        var usbManager = (UsbManager) getContext().getSystemService(Context.USB_SERVICE);
+        if (usbManager == null) {
+            call.reject("USB service not available");
+            return;
+        }
+
+        // Find device by address
+        var device = findUsbDeviceByAddress(usbManager, address);
+        if (device == null) {
+            call.reject("USB device not found: " + address);
+            return;
+        }
+
+        // Check if permission already granted
+        if (usbManager.hasPermission(device)) {
+            var data = new JSObject();
+            data.put("value", true);
+            call.resolve(data);
+            Log.d(TAG, "USB permission already granted for: " + address);
+            return;
+        }
+
+        // Ensure receiver is registered
+        registerUsbPermissionReceiver();
+
+        // Store the pending call keyed by device identifier
+        String deviceKey = buildDeviceKey(device);
+        
+        // Check if there's already a pending request for this device
+        PluginCall existingCall = pendingUsbPermissionCalls.get(deviceKey);
+        if (existingCall != null) {
+            // Reject the existing call and replace with new one
+            existingCall.reject("Superseded by new permission request");
+        }
+        pendingUsbPermissionCalls.put(deviceKey, call);
+
+        // Create PendingIntent for the permission request
+        Intent intent = new Intent(ACTION_USB_PERMISSION);
+        intent.setPackage(getContext().getPackageName());
+        
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            flags |= PendingIntent.FLAG_MUTABLE;
+        }
+        
+        PendingIntent pendingIntent = PendingIntent.getBroadcast(
+            getContext(),
+            device.getDeviceId(),
+            intent,
+            flags
+        );
+
+        // Request permission - the result will be delivered via the BroadcastReceiver
+        Log.d(TAG, "Requesting USB permission for: " + address);
+        usbManager.requestPermission(device, pendingIntent);
+    }
+
+    /**
+     * Finds a USB device by address string.
+     * Address format: "vendorId:productId" or "vendorId:productId:deviceNamePart"
+     */
+    private UsbDevice findUsbDeviceByAddress(UsbManager usbManager, String address) {
+        if (address == null || address.isEmpty()) {
+            return null;
+        }
+
+        var parts = address.split(":");
+        if (parts.length < 2) {
+            return null;
+        }
+
+        int vendorId;
+        int productId;
+        String deviceNamePart = parts.length >= 3 ? parts[2] : null;
+
+        try {
+            vendorId = Integer.parseInt(parts[0]);
+            productId = Integer.parseInt(parts[1]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+
+        var deviceList = usbManager.getDeviceList();
+        for (var device : deviceList.values()) {
+            if (device.getVendorId() == vendorId && device.getProductId() == productId) {
+                if (deviceNamePart != null && !deviceNamePart.isEmpty()) {
+                    if (device.getDeviceName().endsWith("/" + deviceNamePart) ||
+                        device.getDeviceName().equals(deviceNamePart)) {
+                        return device;
+                    }
+                } else {
+                    // No device name specified, return first match
+                    return device;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    // ==========================================================================
+    // Printer Management Methods
+    // ==========================================================================
+
     @SuppressWarnings("unused")
     @PluginMethod
     public void createPrinter(PluginCall call) {
@@ -150,15 +492,19 @@ public class EscPosPrinterPlugin extends Plugin {
                 if (!assertBluetoothAdapter(call)) {
                     return;
                 }
-
-                // var useLowEnergy = call.getBoolean("le", true) && getContext().getPackageManager().hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE);
-                // var secure = call.getBoolean("secure", true);
-
                 printer = new BluetoothPrinter(bluetoothAdapter, address);
                 break;
             }
+            case "usb": {
+                if (address == null || address.isEmpty()) {
+                    call.reject("Address is required for USB connection");
+                    return;
+                }
+                printer = new UsbPrinter(getContext(), address);
+                break;
+            }
             default: {
-                call.reject("Connection type not known.");
+                call.reject("Connection type not known: " + connectionType);
                 return;
             }
         }
@@ -177,7 +523,10 @@ public class EscPosPrinterPlugin extends Plugin {
 
         var hasPrinter = printersMap.containsKey(hashKey);
         if (hasPrinter) {
-            printersMap.remove(hashKey);
+            var printer = printersMap.remove(hashKey);
+            if (printer != null) {
+                printer.disconnect();
+            }
         }
 
         var data = new JSObject();
@@ -207,8 +556,11 @@ public class EscPosPrinterPlugin extends Plugin {
         }
 
         try {
-            if (printer instanceof BluetoothPrinter && !assertBluetoothEnabled(call) || !assertBluetoothPermission(call)) {
-                return;
+            // Only check Bluetooth permissions for BluetoothPrinter
+            if (printer instanceof BluetoothPrinter) {
+                if (!assertBluetoothEnabled(call) || !assertBluetoothPermission(call)) {
+                    return;
+                }
             }
 
             printer.connect();
@@ -257,6 +609,12 @@ public class EscPosPrinterPlugin extends Plugin {
         }
     }
 
+    /**
+     * Read available data from the printer.
+     * 
+     * Note: For USB printers, this is best-effort and may return empty arrays
+     * if no data is available. Not all USB printers support read operations.
+     */
     @SuppressWarnings("unused")
     @PluginMethod
     public void readFromPrinter(PluginCall call) {
@@ -265,8 +623,6 @@ public class EscPosPrinterPlugin extends Plugin {
             return;
         }
 
-        // TODO: read like https://github.com/AdoptOpenJDK/openjdk-jdk11/blob/master/src/java.base/share/classes/java/io/InputStream.java
-
         try {
             var bytes = printer.read();
             var bytesArray = new JSArray();
@@ -274,7 +630,7 @@ public class EscPosPrinterPlugin extends Plugin {
                 try {
                     bytesArray.put(i, bytes[i]);
                 } catch (JSONException e) {
-
+                    // Ignore JSON errors for individual bytes
                 }
             }
 
@@ -285,6 +641,10 @@ public class EscPosPrinterPlugin extends Plugin {
             rejectWithPrinterException(call, e);
         }
     }
+
+    // ==========================================================================
+    // Helper Methods
+    // ==========================================================================
 
     private boolean assertBluetoothAdapter(PluginCall call) {
         if (bluetoothAdapter == null) {
@@ -328,10 +688,10 @@ public class EscPosPrinterPlugin extends Plugin {
                 var method = this.getClass().getMethod(methodName, PluginCall.class);
                 method.invoke(this, call);
             } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
-
+                call.reject("Failed to invoke method after permission grant: " + e.getMessage());
             }
         } else {
-            call.reject("Bluetooth not granted.");
+            call.reject("Bluetooth permission not granted.");
         }
     }
 
@@ -339,7 +699,7 @@ public class EscPosPrinterPlugin extends Plugin {
         var hashKey = call.getString("hashKey");
         var printer = printersMap.get(hashKey);
         if (printer == null) {
-            call.reject("Printer with " + hashKey + " hash not found.");
+            call.reject("Printer with hash " + hashKey + " not found.");
             return null;
         }
         return printer;

@@ -1,9 +1,18 @@
 import { WebPlugin } from '@capacitor/core';
 
-import type { CreatePrinterOptions, EscPosPrinterPlugin, ValueResult, WithHashKey, SendToPrinterOptions, BluetoothDevicesResult } from './definitions';
+import type {
+  CreatePrinterOptions,
+  EscPosPrinterPlugin,
+  ValueResult,
+  WithHashKey,
+  WithAddress,
+  SendToPrinterOptions,
+  BluetoothDevicesResult,
+  UsbDevicesResult,
+} from './definitions';
 
 export class EscPosPrinterWeb extends WebPlugin implements EscPosPrinterPlugin {
-  async requestBluetoothEnable(): Promise<ValueResult<boolean>>{
+  async requestBluetoothEnable(): Promise<ValueResult<boolean>> {
     return { value: false };
   }
 
@@ -11,6 +20,18 @@ export class EscPosPrinterWeb extends WebPlugin implements EscPosPrinterPlugin {
     const devices = await navigator.bluetooth.getDevices();
     console.log('getBluetoothPrinterDevices', devices);
     return { devices: [] };
+  }
+
+  async getUsbPrinterDevices(): Promise<UsbDevicesResult> {
+    // USB printing is not supported on web platform
+    console.log('getUsbPrinterDevices: USB not supported on web');
+    return { devices: [] };
+  }
+
+  async requestUsbPermission(_options: WithAddress): Promise<ValueResult<boolean>> {
+    // USB printing is not supported on web platform
+    console.log('requestUsbPermission: USB not supported on web');
+    return { value: false };
   }
 
   async createPrinter(options: CreatePrinterOptions): Promise<ValueResult<string>> {

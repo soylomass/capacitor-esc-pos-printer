@@ -1,5 +1,5 @@
 {
-  "name": "capacitor-esc-pos-printer",
+  "name": "@fedejm/capacitor-esc-pos-printer",
   "version": "0.1.0",
   "description": "CapacitorJS wrapper for ESC POS (native) printers.",
   "main": "dist/plugin.cjs.js",
@@ -13,14 +13,17 @@
     "ios/Plugin/",
     "CapacitorEscPosPrinter.podspec"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/andreidigori/capacitor-esc-pos-printer.git"
+    "url": "git+https://github.com/soylomass/capacitor-esc-pos-printer.git"
   },
   "bugs": {
-    "url": "https://github.com/andreidigori/capacitor-esc-pos-printer/issues"
+    "url": "https://github.com/soylomass/capacitor-esc-pos-printer/issues"
   },
   "keywords": [
     "capacitor",

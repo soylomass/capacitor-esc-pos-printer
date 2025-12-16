@@ -3,4 +3,6 @@ export enum PrinterErrorCode {
   NotConnected = 2,
   Send = 3,
   Read = 4,
+  Permissions = 5,
+  DeviceNotFound = 6,
 }

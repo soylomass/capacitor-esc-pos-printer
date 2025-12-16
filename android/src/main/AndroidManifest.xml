@@ -1,5 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   xmlns:tools="http://schemas.android.com/tools">
+  <!-- Bluetooth permissions -->
   <uses-permission android:name="android.permission.BLUETOOTH"
     android:maxSdkVersion="30" />
   <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
@@ -14,8 +15,13 @@
   <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"
     tools:targetApi="s" />
 
+  <!-- Bluetooth features (not required) -->
   <uses-feature android:name="android.hardware.bluetooth"
     android:required="false" />
   <uses-feature android:name="android.hardware.bluetooth_le"
+    android:required="false" />
+
+  <!-- USB Host feature (not required - allows app to work on devices without USB host) -->
+  <uses-feature android:name="android.hardware.usb.host"
     android:required="false" />
 </manifest>
