@@ -43,6 +43,10 @@ import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 
 @SuppressWarnings("unused")
 @CapacitorPlugin(
@@ -63,6 +67,17 @@ public class EscPosPrinterPlugin extends Plugin {
 
     private BluetoothAdapter bluetoothAdapter;
     private HashMap<String, BasePrinter> printersMap = new HashMap<>();
+
+    /**
+     * Per-printer single-thread executors.
+     *
+     * Goals:
+     * - Allow concurrent printing to different printers (e.g. ticket + labels).
+     * - Preserve ordering and prevent interleaving for the SAME printer.
+     *
+     * Keyed by the Capacitor printer hashKey (created by createPrinter()).
+     */
+    private final Map<String, ExecutorService> printerExecutors = new ConcurrentHashMap<>();
     
     // USB permission request tracking
     private final Map<String, PluginCall> pendingUsbPermissionCalls = new HashMap<>();
@@ -83,6 +98,16 @@ public class EscPosPrinterPlugin extends Plugin {
     protected void handleOnDestroy() {
         super.handleOnDestroy();
         unregisterUsbPermissionReceiver();
+
+        // Stop all per-printer executors (best-effort). Any pending JS calls are moot during teardown.
+        for (ExecutorService executor : printerExecutors.values()) {
+            try {
+                executor.shutdownNow();
+            } catch (Exception ignored) {
+                // ignore
+            }
+        }
+        printerExecutors.clear();
         
         // Clear any pending permission calls
         for (PluginCall call : pendingUsbPermissionCalls.values()) {
@@ -529,6 +554,18 @@ public class EscPosPrinterPlugin extends Plugin {
             }
         }
 
+        // Gracefully stop executor for this printer (let queued sends drain).
+        if (hashKey != null) {
+            var executor = printerExecutors.remove(hashKey);
+            if (executor != null) {
+                try {
+                    executor.shutdown();
+                } catch (Exception ignored) {
+                    // ignore
+                }
+            }
+        }
+
         var data = new JSObject();
         data.put("value", hasPrinter);
         call.resolve(data);
@@ -587,8 +624,15 @@ public class EscPosPrinterPlugin extends Plugin {
     @SuppressWarnings("unused")
     @PluginMethod
     public void sendToPrinter(PluginCall call) {
-        var printer = getGuardedPrinterByHash(call);
+        var hashKey = call.getString("hashKey");
+        if (hashKey == null) {
+            call.reject("hashKey is required.");
+            return;
+        }
+
+        var printer = printersMap.get(hashKey);
         if (printer == null) {
+            call.reject("Printer with hash " + hashKey + " not found.");
             return;
         }
 
@@ -600,13 +644,32 @@ public class EscPosPrinterPlugin extends Plugin {
             bytesArray[i] = (byte)data.optInt(i);
         }
 
-        try {
-            printer.send(bytesArray, waitingTime);
+        // Serialize per-printer sends, but allow concurrency across printers.
+        // This prevents long ticket prints from blocking label printers.
+        final int finalWaitingTime = waitingTime != null ? waitingTime : 0;
+        final byte[] finalBytes = bytesArray;
 
-            call.resolve();
-        } catch (PrinterException e) {
-            rejectWithPrinterException(call, e);
-        }
+        var executor = printerExecutors.computeIfAbsent(hashKey, (key) -> {
+            final String suffix = key.length() > 8 ? key.substring(0, 8) : key;
+            ThreadFactory tf = r -> {
+                Thread t = new Thread(r);
+                t.setName("EscPosPrinter-" + suffix);
+                t.setDaemon(true);
+                return t;
+            };
+            return Executors.newSingleThreadExecutor(tf);
+        });
+
+        executor.execute(() -> {
+            try {
+                printer.send(finalBytes, finalWaitingTime);
+                call.resolve();
+            } catch (PrinterException e) {
+                rejectWithPrinterException(call, e);
+            } catch (Exception e) {
+                call.reject(e.getMessage() != null ? e.getMessage() : "Unknown error");
+            }
+        });
     }
 
     /**
