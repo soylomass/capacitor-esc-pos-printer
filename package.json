@@ -1,6 +1,6 @@
 {
   "name": "@fedejm/capacitor-esc-pos-printer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "CapacitorJS wrapper for ESC POS (native) printers.",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
