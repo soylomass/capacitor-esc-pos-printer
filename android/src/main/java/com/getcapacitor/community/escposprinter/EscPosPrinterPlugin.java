@@ -40,12 +40,12 @@ import com.getcapacitor.community.escposprinter.printers.exceptions.PrinterExcep
 import org.json.JSONException;
 
 import java.lang.reflect.InvocationTargetException;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 
 @SuppressWarnings("unused")
@@ -66,7 +66,7 @@ public class EscPosPrinterPlugin extends Plugin {
     private static final String ACTION_USB_PERMISSION = "com.getcapacitor.community.escposprinter.USB_PERMISSION";
 
     private BluetoothAdapter bluetoothAdapter;
-    private HashMap<String, BasePrinter> printersMap = new HashMap<>();
+    private final Map<String, BasePrinter> printersMap = new ConcurrentHashMap<>();
 
     /**
      * Per-printer single-thread executors.
@@ -80,9 +80,22 @@ public class EscPosPrinterPlugin extends Plugin {
     private final Map<String, ExecutorService> printerExecutors = new ConcurrentHashMap<>();
     
     // USB permission request tracking
-    private final Map<String, PluginCall> pendingUsbPermissionCalls = new HashMap<>();
+    private final Map<String, PluginCall> pendingUsbPermissionCalls = new ConcurrentHashMap<>();
     private BroadcastReceiver usbPermissionReceiver;
     private boolean receiverRegistered = false;
+
+    private ExecutorService getOrCreatePrinterExecutor(String hashKey) {
+        return printerExecutors.computeIfAbsent(hashKey, (key) -> {
+            final String suffix = key.length() > 8 ? key.substring(0, 8) : key;
+            ThreadFactory tf = r -> {
+                Thread t = new Thread(r);
+                t.setName("EscPosPrinter-" + suffix);
+                t.setDaemon(true);
+                return t;
+            };
+            return Executors.newSingleThreadExecutor(tf);
+        });
+    }
 
     // ==========================================================================
     // Plugin Lifecycle
@@ -428,12 +441,11 @@ public class EscPosPrinterPlugin extends Plugin {
         String deviceKey = buildDeviceKey(device);
         
         // Check if there's already a pending request for this device
-        PluginCall existingCall = pendingUsbPermissionCalls.get(deviceKey);
-        if (existingCall != null) {
+        PluginCall previousCall = pendingUsbPermissionCalls.put(deviceKey, call);
+        if (previousCall != null) {
             // Reject the existing call and replace with new one
-            existingCall.reject("Superseded by new permission request");
+            previousCall.reject("Superseded by new permission request");
         }
-        pendingUsbPermissionCalls.put(deviceKey, call);
 
         // Create PendingIntent for the permission request
         Intent intent = new Intent(ACTION_USB_PERMISSION);
@@ -545,30 +557,66 @@ public class EscPosPrinterPlugin extends Plugin {
     @PluginMethod
     public void disposePrinter(PluginCall call) {
         var hashKey = call.getString("hashKey");
-
-        var hasPrinter = printersMap.containsKey(hashKey);
-        if (hasPrinter) {
-            var printer = printersMap.remove(hashKey);
-            if (printer != null) {
-                printer.disconnect();
-            }
+        if (hashKey == null) {
+            call.reject("hashKey is required.");
+            return;
         }
 
-        // Gracefully stop executor for this printer (let queued sends drain).
-        if (hashKey != null) {
-            var executor = printerExecutors.remove(hashKey);
-            if (executor != null) {
+        // Prevent new operations from being enqueued for this printer.
+        var printer = printersMap.remove(hashKey);
+        final boolean hasPrinter = printer != null;
+
+        // Serialize dispose after any in-flight sends for this same printer.
+        final BasePrinter finalPrinter = printer;
+        final ExecutorService executor = getOrCreatePrinterExecutor(hashKey);
+
+        try {
+            executor.execute(() -> {
                 try {
-                    executor.shutdown();
-                } catch (Exception ignored) {
-                    // ignore
-                }
-            }
-        }
+                    if (finalPrinter != null) {
+                        finalPrinter.disconnect();
+                    }
+                } finally {
+                    try {
+                        executor.shutdown();
+                    } catch (Exception ignored) {
+                        // ignore
+                    }
+                    try {
+                        printerExecutors.remove(hashKey);
+                    } catch (Exception ignored) {
+                        // ignore
+                    }
 
-        var data = new JSObject();
-        data.put("value", hasPrinter);
-        call.resolve(data);
+                    var data = new JSObject();
+                    data.put("value", hasPrinter);
+                    call.resolve(data);
+                }
+            });
+        } catch (Exception e) {
+            // Executor rejected (already shutting down): fallback to best-effort direct cleanup.
+            try {
+                if (finalPrinter != null) {
+                    finalPrinter.disconnect();
+                }
+            } catch (Exception ignored) {
+                // ignore
+            }
+            try {
+                executor.shutdown();
+            } catch (Exception ignored) {
+                // ignore
+            }
+            try {
+                printerExecutors.remove(hashKey);
+            } catch (Exception ignored) {
+                // ignore
+            }
+
+            var data = new JSObject();
+            data.put("value", hasPrinter);
+            call.resolve(data);
+        }
     }
 
     @SuppressWarnings("unused")
@@ -611,14 +659,40 @@ public class EscPosPrinterPlugin extends Plugin {
     @SuppressWarnings("unused")
     @PluginMethod
     public void disconnectPrinter(PluginCall call) {
-        var printer = getGuardedPrinterByHash(call);
-        if (printer == null) {
+        var hashKey = call.getString("hashKey");
+        if (hashKey == null) {
+            call.reject("hashKey is required.");
             return;
         }
 
-        printer.disconnect();
+        var printer = printersMap.get(hashKey);
+        if (printer == null) {
+            call.reject("Printer with hash " + hashKey + " not found.");
+            return;
+        }
 
-        call.resolve();
+        // Serialize disconnect after any in-flight sends for this same printer.
+        final BasePrinter finalPrinter = printer;
+        final ExecutorService executor = getOrCreatePrinterExecutor(hashKey);
+
+        try {
+            executor.execute(() -> {
+                try {
+                    finalPrinter.disconnect();
+                    call.resolve();
+                } catch (Exception e) {
+                    call.reject(e.getMessage() != null ? e.getMessage() : "Unknown error");
+                }
+            });
+        } catch (Exception e) {
+            // Best-effort fallback
+            try {
+                finalPrinter.disconnect();
+            } catch (Exception ignored) {
+                // ignore
+            }
+            call.resolve();
+        }
     }
 
     @SuppressWarnings("unused")
@@ -638,6 +712,10 @@ public class EscPosPrinterPlugin extends Plugin {
 
         var waitingTime = call.getInt("waitingTime", 0);
         var data = call.getArray("data");
+        if (data == null) {
+            call.reject("data is required.");
+            return;
+        }
 
         byte[] bytesArray = new byte[data.length()];
         for (var i = 0; i < bytesArray.length; i++) {
@@ -649,27 +727,24 @@ public class EscPosPrinterPlugin extends Plugin {
         final int finalWaitingTime = waitingTime != null ? waitingTime : 0;
         final byte[] finalBytes = bytesArray;
 
-        var executor = printerExecutors.computeIfAbsent(hashKey, (key) -> {
-            final String suffix = key.length() > 8 ? key.substring(0, 8) : key;
-            ThreadFactory tf = r -> {
-                Thread t = new Thread(r);
-                t.setName("EscPosPrinter-" + suffix);
-                t.setDaemon(true);
-                return t;
-            };
-            return Executors.newSingleThreadExecutor(tf);
-        });
+        var executor = getOrCreatePrinterExecutor(hashKey);
 
-        executor.execute(() -> {
-            try {
-                printer.send(finalBytes, finalWaitingTime);
-                call.resolve();
-            } catch (PrinterException e) {
-                rejectWithPrinterException(call, e);
-            } catch (Exception e) {
-                call.reject(e.getMessage() != null ? e.getMessage() : "Unknown error");
-            }
-        });
+        try {
+            executor.execute(() -> {
+                try {
+                    printer.send(finalBytes, finalWaitingTime);
+                    call.resolve();
+                } catch (PrinterException e) {
+                    rejectWithPrinterException(call, e);
+                } catch (Exception e) {
+                    call.reject(e.getMessage() != null ? e.getMessage() : "Unknown error");
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            call.reject("Printer executor is shutting down.");
+        } catch (Exception e) {
+            call.reject(e.getMessage() != null ? e.getMessage() : "Unknown error");
+        }
     }
 
     /**
@@ -760,6 +835,10 @@ public class EscPosPrinterPlugin extends Plugin {
 
     private BasePrinter getGuardedPrinterByHash(PluginCall call) {
         var hashKey = call.getString("hashKey");
+        if (hashKey == null) {
+            call.reject("hashKey is required.");
+            return null;
+        }
         var printer = printersMap.get(hashKey);
         if (printer == null) {
             call.reject("Printer with hash " + hashKey + " not found.");
