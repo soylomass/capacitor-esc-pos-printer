@@ -28,6 +28,7 @@ import java.util.HashMap;
 public class UsbPrinter extends BasePrinter {
     private static final String TAG = "UsbPrinter";
     private static final int BULK_TRANSFER_TIMEOUT_MS = 5000;
+    private static final int BULK_TRANSFER_CHUNK_SIZE_BYTES = 1024;
 
     private final Context context;
     private final String address;
@@ -273,20 +274,38 @@ public class UsbPrinter extends BasePrinter {
 
         @Override
         public void write(byte[] buffer, int offset, int length) throws IOException {
-            byte[] data;
-            if (offset == 0 && length == buffer.length) {
-                data = buffer;
-            } else {
-                data = new byte[length];
-                System.arraycopy(buffer, offset, data, 0, length);
+            if (buffer == null) {
+                throw new NullPointerException("buffer is null");
+            }
+            if (offset < 0 || length < 0 || offset + length > buffer.length) {
+                throw new IndexOutOfBoundsException(
+                    "Invalid offset/length (offset=" + offset + ", length=" + length + ", buffer.length=" + buffer.length + ")"
+                );
+            }
+            if (length == 0) {
+                return;
             }
 
-            int result = connection.bulkTransfer(endpoint, data, data.length, BULK_TRANSFER_TIMEOUT_MS);
-            if (result < 0) {
-                throw new IOException("USB bulk transfer failed with result: " + result);
-            }
-            if (result != data.length) {
-                Log.w(TAG, "USB bulk transfer incomplete: sent " + result + " of " + data.length + " bytes");
+            int bytesSent = 0;
+            final byte[] chunk = new byte[Math.min(BULK_TRANSFER_CHUNK_SIZE_BYTES, length)];
+            while (bytesSent < length) {
+                final int toSend = Math.min(chunk.length, length - bytesSent);
+                System.arraycopy(buffer, offset + bytesSent, chunk, 0, toSend);
+
+                final int result = connection.bulkTransfer(endpoint, chunk, toSend, BULK_TRANSFER_TIMEOUT_MS);
+                if (result <= 0) {
+                    throw new IOException(
+                        "USB bulk transfer failed with result: " + result + " (sent " + bytesSent + " of " + length + " bytes)"
+                    );
+                }
+                if (result != toSend) {
+                    Log.w(
+                        TAG,
+                        "USB bulk transfer incomplete chunk: sent " + result + " of " + toSend + " bytes (total " + (bytesSent + result) + " of " + length + ")"
+                    );
+                }
+
+                bytesSent += result;
             }
         }
 

@@ -56,6 +56,13 @@ public abstract class BasePrinter {
         } catch (IOException | InterruptedException e) {
             e.printStackTrace();
 
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+
+            // Self-heal: ensure subsequent sends reconnect with a fresh connection.
+            this.disconnect();
+
             throw new PrinterException(PrinterErrorCode.SEND, e.getMessage());
         }
     }

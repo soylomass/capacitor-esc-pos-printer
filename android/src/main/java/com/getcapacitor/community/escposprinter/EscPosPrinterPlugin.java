@@ -212,6 +212,22 @@ public class EscPosPrinterPlugin extends Plugin {
         return device.getVendorId() + ":" + device.getProductId() + ":" + deviceNamePart;
     }
 
+    private String sanitizeUsbDeviceName(String name) {
+        if (name == null) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (Character.isISOControl(c)) {
+                continue;
+            }
+            sb.append(c);
+        }
+        String cleaned = sb.toString().trim();
+        return cleaned.isEmpty() ? null : cleaned;
+    }
+
     // ==========================================================================
     // Bluetooth Methods
     // ==========================================================================
@@ -326,7 +342,7 @@ public class EscPosPrinterPlugin extends Plugin {
             deviceObject.put("id", deviceKey);
 
             // Name: use product name if available, otherwise device name
-            var name = device.getProductName();
+            var name = sanitizeUsbDeviceName(device.getProductName());
             if (name == null || name.isEmpty()) {
                 name = "USB Device " + device.getVendorId() + ":" + device.getProductId();
             }
