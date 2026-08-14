@@ -7,4 +7,6 @@ public class PrinterErrorCode {
     public static final int READ = 4;
     public static final int PERMISSIONS = 5;
     public static final int DEVICE_NOT_FOUND = 6;
+    /** The printer answered a status request reporting a problem (paper out / offline / error). */
+    public static final int STATUS = 7;
 }

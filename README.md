@@ -130,10 +130,15 @@ The printer connection follows this lifecycle:
 
 <docgen-index>
 
+* [`checkPermissions()`](#checkpermissions)
+* [`requestPermissions()`](#requestpermissions)
 * [`requestBluetoothEnable()`](#requestbluetoothenable)
 * [`getBluetoothPrinterDevices()`](#getbluetoothprinterdevices)
 * [`getUsbPrinterDevices()`](#getusbprinterdevices)
 * [`requestUsbPermission(...)`](#requestusbpermission)
+* [`getNetworkPrinterDevices(...)`](#getnetworkprinterdevices)
+* [`probeNetworkPrinter(...)`](#probenetworkprinter)
+* [`getCapabilities()`](#getcapabilities)
 * [`createPrinter(...)`](#createprinter)
 * [`disposePrinter(...)`](#disposeprinter)
 * [`isPrinterConnected(...)`](#isprinterconnected)
@@ -142,12 +147,40 @@ The printer connection follows this lifecycle:
 * [`sendToPrinter(...)`](#sendtoprinter)
 * [`readFromPrinter(...)`](#readfromprinter)
 * [Interfaces](#interfaces)
+* [Type Aliases](#type-aliases)
 * [Enums](#enums)
 
 </docgen-index>
 
 <docgen-api>
 <!--Update the source file JSDoc comments and rerun docgen to update the docs below-->
+
+### checkPermissions()
+
+```typescript
+checkPermissions() => Promise<PrinterPermissionStatus>
+```
+
+Checks the current state of the plugin's runtime permissions WITHOUT
+prompting the user. Useful to keep passive/startup paths prompt-free.
+
+**Returns:** <code>Promise&lt;<a href="#printerpermissionstatus">PrinterPermissionStatus</a>&gt;</code>
+
+--------------------
+
+
+### requestPermissions()
+
+```typescript
+requestPermissions() => Promise<PrinterPermissionStatus>
+```
+
+Requests the plugin's runtime permissions, prompting the user if needed.
+
+**Returns:** <code>Promise&lt;<a href="#printerpermissionstatus">PrinterPermissionStatus</a>&gt;</code>
+
+--------------------
+
 
 ### requestBluetoothEnable()
 
@@ -199,6 +232,56 @@ Note: May require user interaction via system UI.
 | **`options`** | <code><a href="#withaddress">WithAddress</a></code> |
 
 **Returns:** <code>Promise&lt;<a href="#valueresult">ValueResult</a>&lt;boolean&gt;&gt;</code>
+
+--------------------
+
+
+### getNetworkPrinterDevices(...)
+
+```typescript
+getNetworkPrinterDevices(options?: GetNetworkPrinterDevicesOptions | undefined) => Promise<NetworkDevicesResult>
+```
+
+Discovers network printers by sweeping each local /24 subnet on the given
+port (default 9100). Only one scan may run at a time.
+
+| Param         | Type                                                                                        |
+| ------------- | ------------------------------------------------------------------------------------------- |
+| **`options`** | <code><a href="#getnetworkprinterdevicesoptions">GetNetworkPrinterDevicesOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#networkdevicesresult">NetworkDevicesResult</a>&gt;</code>
+
+--------------------
+
+
+### probeNetworkPrinter(...)
+
+```typescript
+probeNetworkPrinter(options: ProbeNetworkPrinterOptions) => Promise<NetworkProbeResult>
+```
+
+Probes a network printer: TCP connect + status request (DLE EOT by
+default). Never rejects for unreachable devices.
+
+| Param         | Type                                                                              |
+| ------------- | --------------------------------------------------------------------------------- |
+| **`options`** | <code><a href="#probenetworkprinteroptions">ProbeNetworkPrinterOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#networkproberesult">NetworkProbeResult</a>&gt;</code>
+
+--------------------
+
+
+### getCapabilities()
+
+```typescript
+getCapabilities() => Promise<PrinterCapabilities>
+```
+
+Reports what the installed NATIVE build supports, for feature detection
+(native code only updates with an app-store release).
+
+**Returns:** <code>Promise&lt;<a href="#printercapabilities">PrinterCapabilities</a>&gt;</code>
 
 --------------------
 
@@ -305,6 +388,15 @@ readFromPrinter(options: WithHashKey) => Promise<ValueResult<number[]>>
 ### Interfaces
 
 
+#### PrinterPermissionStatus
+
+Permission status for the plugin's declared permission aliases.
+
+| Prop            | Type                                                        | Description                                                          |
+| --------------- | ----------------------------------------------------------- | -------------------------------------------------------------------- |
+| **`bluetooth`** | <code><a href="#permissionstate">PermissionState</a></code> | BLUETOOTH_CONNECT + BLUETOOTH_SCAN runtime permissions (Android 12+) |
+
+
 #### ValueResult
 
 | Prop        | Type           |
@@ -353,12 +445,75 @@ Information about a discovered USB device.
 | **`address`** | <code>string</code> |
 
 
+#### NetworkDevicesResult
+
+Result from network printer discovery (TCP port sweep).
+
+| Prop          | Type                             |
+| ------------- | -------------------------------- |
+| **`devices`** | <code>NetworkDeviceInfo[]</code> |
+
+
+#### NetworkDeviceInfo
+
+Information about a discovered network printer candidate.
+
+| Prop       | Type                | Description                                          |
+| ---------- | ------------------- | ---------------------------------------------------- |
+| **`id`**   | <code>string</code> | Stable identifier for the device (format: "ip:port") |
+| **`name`** | <code>string</code> | Human-readable name                                  |
+| **`ip`**   | <code>string</code> | IPv4 address                                         |
+| **`port`** | <code>number</code> | TCP port the device answered on                      |
+
+
+#### GetNetworkPrinterDevicesOptions
+
+| Prop            | Type                | Description                                  |
+| --------------- | ------------------- | -------------------------------------------- |
+| **`port`**      | <code>number</code> | TCP port to sweep (default 9100)             |
+| **`timeoutMs`** | <code>number</code> | Per-host connect timeout in ms (default 500) |
+
+
+#### NetworkProbeResult
+
+Result from probing a network printer.
+Never rejects for unreachable devices — reachability IS the result.
+
+| Prop                 | Type                  | Description                                                                          |
+| -------------------- | --------------------- | ------------------------------------------------------------------------------------ |
+| **`reachable`**      | <code>boolean</code>  | Whether a TCP connection could be established                                        |
+| **`supportsDleEot`** | <code>boolean</code>  | Whether the device answered the DLE EOT status request                               |
+| **`statusDetail`**   | <code>string[]</code> | Decoded status flags when the device answered (e.g. "PAPER_OUT", "OFFLINE", "ERROR") |
+
+
+#### ProbeNetworkPrinterOptions
+
+| Prop             | Type                  | Description                                                                 |
+| ---------------- | --------------------- | --------------------------------------------------------------------------- |
+| **`address`**    | <code>string</code>   | Network printer address, "host[:port]" (default port 9100)                  |
+| **`probeBytes`** | <code>number[]</code> | Bytes to send as the status probe (default DLE EOT n=1: [0x10, 0x04, 0x01]) |
+
+
+#### PrinterCapabilities
+
+Result from getCapabilities(): what the installed NATIVE build supports.
+Native code only updates with an app-store release, so the JS side must
+feature-detect instead of assuming the npm package version matches.
+
+| Prop                | Type                                                                    | Description                                                                       |
+| ------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| **`nativeVersion`** | <code>string</code>                                                     | Native implementation version (kept in sync with the npm version at release time) |
+| **`transports`**    | <code>('usb' \| 'bluetooth' \| 'network')[]</code>                      | Supported printer transports                                                      |
+| **`features`**      | <code>('networkScan' \| 'networkProbe' \| 'dleEotStatusCheck')[]</code> | Supported optional features                                                       |
+
+
 #### CreatePrinterOptions
 
-| Prop                 | Type                                                                    | Description                                                                                                                                                                                                    |
-| -------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`connectionType`** | <code><a href="#printerconnectiontype">PrinterConnectionType</a></code> |                                                                                                                                                                                                                |
-| **`address`**        | <code>string</code>                                                     | Address/identifier for the printer: - Bluetooth: MAC address (e.g., "00:11:22:33:44:55") - USB: Device identifier (e.g., "1234:5678:002") - Network: IP address and optional port (e.g., "192.168.1.100:9100") |
+| Prop                 | Type                                                                    | Description                                                                                                                                                                                                                                                                                                                                 |
+| -------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`connectionType`** | <code><a href="#printerconnectiontype">PrinterConnectionType</a></code> |                                                                                                                                                                                                                                                                                                                                             |
+| **`address`**        | <code>string</code>                                                     | Address/identifier for the printer: - Bluetooth: MAC address (e.g., "00:11:22:33:44:55") - USB: Device identifier (e.g., "1234:5678:002") - Network: IP address and optional port, "host[:port]" (e.g., "192.168.1.100:9100", default port 9100)                                                                                            |
+| **`statusCheck`**    | <code>boolean</code>                                                    | Network only: run a DLE EOT status check after each send, failing the job when the printer reports paper-out/offline/error. Only enable it for printers that answered the DLE EOT probe (see probeNetworkPrinter) — printers that ignore it are unaffected either way, but enabling it without a probe adds a pointless 300ms wait per job. |
 
 
 #### WithHashKey
@@ -374,6 +529,14 @@ Information about a discovered USB device.
 | ----------------- | --------------------- |
 | **`data`**        | <code>number[]</code> |
 | **`waitingTime`** | <code>number</code>   |
+
+
+### Type Aliases
+
+
+#### PermissionState
+
+<code>'prompt' | 'prompt-with-rationale' | 'granted' | 'denied'</code>
 
 
 ### Enums

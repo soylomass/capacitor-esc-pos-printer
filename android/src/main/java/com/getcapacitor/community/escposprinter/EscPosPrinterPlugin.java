@@ -34,19 +34,38 @@ import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
 import com.getcapacitor.community.escposprinter.printers.BasePrinter;
 import com.getcapacitor.community.escposprinter.printers.BluetoothPrinter;
+import com.getcapacitor.community.escposprinter.printers.NetworkAddress;
+import com.getcapacitor.community.escposprinter.printers.NetworkPrinter;
 import com.getcapacitor.community.escposprinter.printers.UsbPrinter;
 import com.getcapacitor.community.escposprinter.printers.exceptions.PrinterException;
 
 import org.json.JSONException;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
+import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @SuppressWarnings("unused")
 @CapacitorPlugin(
@@ -64,6 +83,24 @@ import java.util.concurrent.ThreadFactory;
 public class EscPosPrinterPlugin extends Plugin {
     private static final String TAG = "EscPosPrinterPlugin";
     private static final String ACTION_USB_PERMISSION = "com.getcapacitor.community.escposprinter.USB_PERMISSION";
+
+    /**
+     * Native implementation version, reported by getCapabilities().
+     * RELEASE CHECKLIST: bump this together with package.json "version" on
+     * every release, so the JS side can feature-detect the installed native.
+     */
+    private static final String NATIVE_VERSION = "0.3.0";
+
+    private static final int NETWORK_PROBE_CONNECT_TIMEOUT_MS = 4000;
+    /**
+     * Probes are interactive-only (add/open/test), so a generous reply window
+     * is cheap. 300ms proved too tight on jittery links (emulator NAT, busy
+     * Wi-Fi): late replies caused false "no DLE EOT support" negatives.
+     */
+    private static final int NETWORK_PROBE_REPLY_WINDOW_MS = 1500;
+    private static final int NETWORK_SCAN_DEFAULT_PORT = 9100;
+    private static final int NETWORK_SCAN_DEFAULT_TIMEOUT_MS = 500;
+    private static final int NETWORK_SCAN_CONCURRENCY = 64;
 
     private BluetoothAdapter bluetoothAdapter;
     private final Map<String, BasePrinter> printersMap = new ConcurrentHashMap<>();
@@ -83,6 +120,21 @@ public class EscPosPrinterPlugin extends Plugin {
     private final Map<String, PluginCall> pendingUsbPermissionCalls = new ConcurrentHashMap<>();
     private BroadcastReceiver usbPermissionReceiver;
     private boolean receiverRegistered = false;
+
+    /**
+     * Shared pool for network probes: probes are short-lived and independent,
+     * so a small bounded pool keeps them off the plugin's calling thread
+     * without unbounded thread creation.
+     */
+    private final ExecutorService networkProbeExecutor = Executors.newFixedThreadPool(8, r -> {
+        Thread t = new Thread(r);
+        t.setName("EscPosPrinter-net-probe");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /** Only one network scan may run at a time (each opens up to 64 sockets). */
+    private final AtomicBoolean networkScanRunning = new AtomicBoolean(false);
 
     private ExecutorService getOrCreatePrinterExecutor(String hashKey) {
         return printerExecutors.computeIfAbsent(hashKey, (key) -> {
@@ -121,7 +173,13 @@ public class EscPosPrinterPlugin extends Plugin {
             }
         }
         printerExecutors.clear();
-        
+
+        try {
+            networkProbeExecutor.shutdownNow();
+        } catch (Exception ignored) {
+            // ignore
+        }
+
         // Clear any pending permission calls
         for (PluginCall call : pendingUsbPermissionCalls.values()) {
             call.reject("Plugin destroyed before USB permission response");
@@ -556,6 +614,16 @@ public class EscPosPrinterPlugin extends Plugin {
                 printer = new UsbPrinter(getContext(), address);
                 break;
             }
+            case "network": {
+                var networkAddress = NetworkAddress.parse(address);
+                if (networkAddress == null) {
+                    call.reject("Invalid network address (expected host[:port]): " + address);
+                    return;
+                }
+                var statusCheck = Boolean.TRUE.equals(call.getBoolean("statusCheck", false));
+                printer = new NetworkPrinter(networkAddress.host, networkAddress.port, statusCheck);
+                break;
+            }
             default: {
                 call.reject("Connection type not known: " + connectionType);
                 return;
@@ -651,19 +719,41 @@ public class EscPosPrinterPlugin extends Plugin {
     @SuppressWarnings("unused")
     @PluginMethod
     public void connectPrinter(PluginCall call) {
+        var hashKey = call.getString("hashKey");
         var printer = getGuardedPrinterByHash(call);
         if (printer == null) {
             return;
         }
 
-        try {
-            // Only check Bluetooth permissions for BluetoothPrinter
-            if (printer instanceof BluetoothPrinter) {
-                if (!assertBluetoothEnabled(call) || !assertBluetoothPermission(call)) {
-                    return;
-                }
+        // Only check Bluetooth permissions for BluetoothPrinter
+        if (printer instanceof BluetoothPrinter) {
+            if (!assertBluetoothEnabled(call) || !assertBluetoothPermission(call)) {
+                return;
             }
+        }
 
+        // Network connects block up to 4s on socket timeouts: run them on the
+        // per-printer executor so the shared plugin thread is never held.
+        if (printer instanceof NetworkPrinter) {
+            var executor = getOrCreatePrinterExecutor(hashKey);
+            try {
+                executor.execute(() -> {
+                    try {
+                        printer.connect();
+                        call.resolve();
+                    } catch (PrinterException e) {
+                        rejectWithPrinterException(call, e);
+                    } catch (Exception e) {
+                        call.reject(e.getMessage() != null ? e.getMessage() : "Unknown error");
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                call.reject("Printer executor is shutting down.");
+            }
+            return;
+        }
+
+        try {
             printer.connect();
 
             call.resolve();
@@ -794,6 +884,267 @@ public class EscPosPrinterPlugin extends Plugin {
         } catch (PrinterException e) {
             rejectWithPrinterException(call, e);
         }
+    }
+
+    // ==========================================================================
+    // Network Methods
+    // ==========================================================================
+
+    /**
+     * Setup/monitoring probe for a network printer (port of the desktop
+     * bridge's probeTcpPrinter): TCP connect + optional status request.
+     *
+     * Never rejects for unreachable devices — reachability is the result:
+     * { reachable, supportsDleEot, statusDetail }.
+     *
+     * `probeBytes` defaults to DLE EOT n=1 (0x10 0x04 0x01); the reply byte is
+     * decoded as DLE EOT status flags (OFFLINE / PAPER_OUT / ERROR).
+     */
+    @SuppressWarnings("unused")
+    @PluginMethod
+    public void probeNetworkPrinter(PluginCall call) {
+        var address = call.getString("address");
+        var networkAddress = NetworkAddress.parse(address);
+        if (networkAddress == null) {
+            call.reject("Invalid network address (expected host[:port]): " + address);
+            return;
+        }
+
+        byte[] probeBytes = NetworkPrinter.DLE_EOT_PROBE;
+        var probeArray = call.getArray("probeBytes", null);
+        if (probeArray != null && probeArray.length() > 0) {
+            probeBytes = new byte[probeArray.length()];
+            for (var i = 0; i < probeBytes.length; i++) {
+                probeBytes[i] = (byte) probeArray.optInt(i);
+            }
+        }
+
+        final byte[] finalProbeBytes = probeBytes;
+
+        try {
+            networkProbeExecutor.execute(() -> {
+                var result = new JSObject();
+                Socket socket = new Socket();
+                try {
+                    socket.connect(
+                            new InetSocketAddress(networkAddress.host, networkAddress.port),
+                            NETWORK_PROBE_CONNECT_TIMEOUT_MS
+                    );
+
+                    result.put("reachable", true);
+
+                    OutputStream out = socket.getOutputStream();
+                    out.write(finalProbeBytes);
+                    out.flush();
+
+                    socket.setSoTimeout(NETWORK_PROBE_REPLY_WINDOW_MS);
+                    InputStream in = socket.getInputStream();
+                    int status;
+                    try {
+                        status = in.read();
+                    } catch (SocketTimeoutException e) {
+                        status = -1;
+                    }
+
+                    if (status < 0) {
+                        result.put("supportsDleEot", false);
+                    } else {
+                        result.put("supportsDleEot", true);
+                        var detailArray = new JSArray();
+                        for (String flag : NetworkPrinter.decodeDleEotStatus(status)) {
+                            detailArray.put(flag);
+                        }
+                        result.put("statusDetail", detailArray);
+                    }
+                } catch (IOException e) {
+                    result.put("reachable", false);
+                    result.put("supportsDleEot", false);
+                } finally {
+                    try {
+                        socket.close();
+                    } catch (IOException ignored) {
+                        // ignore
+                    }
+                }
+                call.resolve(result);
+            });
+        } catch (RejectedExecutionException e) {
+            call.reject("Plugin is shutting down.");
+        }
+    }
+
+    /**
+     * Discovers network printers by sweeping each local /24 subnet on the
+     * given port (default 9100), a port of the desktop bridge's tcp-scan.
+     * Only one scan may run at a time.
+     */
+    @SuppressWarnings("unused")
+    @PluginMethod
+    public void getNetworkPrinterDevices(PluginCall call) {
+        var portOption = call.getInt("port", NETWORK_SCAN_DEFAULT_PORT);
+        var timeoutOption = call.getInt("timeoutMs", NETWORK_SCAN_DEFAULT_TIMEOUT_MS);
+        final int port = portOption != null ? portOption : NETWORK_SCAN_DEFAULT_PORT;
+        final int timeoutMs = timeoutOption != null ? timeoutOption : NETWORK_SCAN_DEFAULT_TIMEOUT_MS;
+
+        if (port < 1 || port > 65535) {
+            call.reject("Invalid port: " + port);
+            return;
+        }
+
+        if (!networkScanRunning.compareAndSet(false, true)) {
+            call.reject("A network scan is already in progress.");
+            return;
+        }
+
+        // Coordinator thread: enumerates targets, fans out to a bounded worker
+        // pool and resolves the call when the sweep completes.
+        Thread coordinator = new Thread(() -> {
+            try {
+                List<String> targets = collectNetworkScanTargets();
+                Log.d(TAG, "network scan: sweeping " + targets.size() + " hosts on port " + port);
+
+                List<String> foundHosts = Collections.synchronizedList(new ArrayList<>());
+                AtomicInteger nextIndex = new AtomicInteger(0);
+
+                int workerCount = Math.min(NETWORK_SCAN_CONCURRENCY, Math.max(targets.size(), 1));
+                List<Thread> workers = new ArrayList<>(workerCount);
+                for (var w = 0; w < workerCount; w++) {
+                    Thread worker = new Thread(() -> {
+                        for (;;) {
+                            int i = nextIndex.getAndIncrement();
+                            if (i >= targets.size()) {
+                                return;
+                            }
+                            String host = targets.get(i);
+                            if (probeScanHost(host, port, timeoutMs)) {
+                                foundHosts.add(host);
+                            }
+                        }
+                    });
+                    worker.setName("EscPosPrinter-net-scan-" + w);
+                    worker.setDaemon(true);
+                    workers.add(worker);
+                    worker.start();
+                }
+                for (Thread worker : workers) {
+                    worker.join();
+                }
+
+                var devicesArray = new JSArray();
+                for (String host : foundHosts) {
+                    var deviceObject = new JSObject();
+                    deviceObject.put("id", host + ":" + port);
+                    deviceObject.put("name", "Impresora de red (" + host + ")");
+                    deviceObject.put("ip", host);
+                    deviceObject.put("port", port);
+                    devicesArray.put(deviceObject);
+                }
+
+                Log.d(TAG, "network scan: found " + foundHosts.size() + " devices");
+
+                var data = new JSObject();
+                data.put("devices", devicesArray);
+                call.resolve(data);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                call.reject("Network scan interrupted.");
+            } catch (Exception e) {
+                call.reject(e.getMessage() != null ? e.getMessage() : "Network scan failed.");
+            } finally {
+                networkScanRunning.set(false);
+            }
+        });
+        coordinator.setName("EscPosPrinter-net-scan");
+        coordinator.setDaemon(true);
+        coordinator.start();
+    }
+
+    /** All /24 host addresses of active non-loopback IPv4 interfaces (own IPs excluded). */
+    private List<String> collectNetworkScanTargets() {
+        Set<String> targets = new LinkedHashSet<>();
+        try {
+            var interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface networkInterface = interfaces.nextElement();
+                try {
+                    if (!networkInterface.isUp() || networkInterface.isLoopback()) {
+                        continue;
+                    }
+                } catch (SocketException e) {
+                    continue;
+                }
+                var addresses = networkInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress inetAddress = addresses.nextElement();
+                    if (!(inetAddress instanceof Inet4Address) || inetAddress.isLoopbackAddress()) {
+                        continue;
+                    }
+                    String ownAddress = inetAddress.getHostAddress();
+                    if (ownAddress == null) {
+                        continue;
+                    }
+                    var parts = ownAddress.split("\\.");
+                    if (parts.length != 4) {
+                        continue;
+                    }
+                    String prefix = parts[0] + "." + parts[1] + "." + parts[2];
+                    for (var host = 1; host <= 254; host++) {
+                        String candidate = prefix + "." + host;
+                        if (!candidate.equals(ownAddress)) {
+                            targets.add(candidate);
+                        }
+                    }
+                }
+            }
+        } catch (SocketException e) {
+            Log.w(TAG, "network scan: could not enumerate interfaces: " + e.getMessage());
+        }
+        return new ArrayList<>(targets);
+    }
+
+    private boolean probeScanHost(String host, int port, int timeoutMs) {
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(host, port), timeoutMs);
+            return true;
+        } catch (IOException e) {
+            return false;
+        } finally {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // ignore
+            }
+        }
+    }
+
+    // ==========================================================================
+    // Capabilities
+    // ==========================================================================
+
+    /**
+     * Reports what this native build supports, so the JS side can
+     * feature-detect instead of guessing from the npm package version
+     * (native code only updates with an app-store release).
+     */
+    @SuppressWarnings("unused")
+    @PluginMethod
+    public void getCapabilities(PluginCall call) {
+        var transports = new JSArray();
+        transports.put("usb");
+        transports.put("bluetooth");
+        transports.put("network");
+
+        var features = new JSArray();
+        features.put("networkScan");
+        features.put("networkProbe");
+        features.put("dleEotStatusCheck");
+
+        var data = new JSObject();
+        data.put("nativeVersion", NATIVE_VERSION);
+        data.put("transports", transports);
+        data.put("features", features);
+        call.resolve(data);
     }
 
     // ==========================================================================

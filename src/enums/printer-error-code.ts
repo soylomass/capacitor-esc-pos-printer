@@ -5,4 +5,6 @@ export enum PrinterErrorCode {
   Read = 4,
   Permissions = 5,
   DeviceNotFound = 6,
+  /** The printer answered a status request reporting a problem (paper out / offline / error). */
+  Status = 7,
 }
